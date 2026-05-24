@@ -1,0 +1,38 @@
+[package]
+name = "awslogs"
+version = "0.15.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Read AWS CloudWatch logs from the command line (Rust port of jorgebastida/awslogs)."
+license = "BSD-3-Clause"
+
+[[bin]]
+name = "awslogs"
+path = "src/main.rs"
+
+[lib]
+name = "awslogs"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-cloudwatchlogs = "1"
+aws-credential-types = "1"
+aws-types = "1"
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+supports-color = "3"
+serde_json = "1"
+jmespath = "0.3"
+thiserror = "2"
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
