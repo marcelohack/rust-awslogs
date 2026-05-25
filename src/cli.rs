@@ -255,7 +255,11 @@ fn handle_result<E: Write>(result: Result<(), AwsLogsError>, stderr: &mut E) -> 
             };
             // Match Python: `colored(msg + "\n", "red")` — the newline is INSIDE
             // the color escape, no separate trailing newline.
-            let _ = write!(stderr, "{}", ansi_colored(&format!("{detail}\n"), Color::Red));
+            let _ = write!(
+                stderr,
+                "{}",
+                ansi_colored(&format!("{detail}\n"), Color::Red)
+            );
             code
         }
     }
