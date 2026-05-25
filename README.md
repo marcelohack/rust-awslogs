@@ -119,7 +119,10 @@ awslogs get /var/log/syslog ALL --watch
 awslogs get /var/log/syslog ALL --watch --watch-interval=5    # poll every 5s
 ```
 
-`-w` short-form is supported. Press Ctrl-C to exit cleanly.
+`-w` is the short form of `--watch`. The loop polls every `--watch-interval`
+seconds (default 1). Press **Ctrl-C** at any time to stop watching — the tool
+prints `Closing...` and exits immediately with status 0, even mid-poll or while
+streaming output through a pipe.
 
 ---
 
