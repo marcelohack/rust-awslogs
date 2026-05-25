@@ -245,12 +245,28 @@ fn handle_result<E: Write>(result: Result<(), AwsLogsError>, stderr: &mut E) -> 
                 );
                 return 4;
             }
+            // For SDK errors the top-level Display is terse (e.g. "dispatch
+            // failure"); surface the full source chain so the real cause is
+            // visible. Our own typed errors have no extra chain, so this is a
+            // no-op for them.
+            let detail = match &err {
+                AwsLogsError::Aws(inner) => full_chain(inner),
+                _ => msg,
+            };
             // Match Python: `colored(msg + "\n", "red")` — the newline is INSIDE
             // the color escape, no separate trailing newline.
-            let _ = write!(stderr, "{}", ansi_colored(&format!("{msg}\n"), Color::Red));
+            let _ = write!(stderr, "{}", ansi_colored(&format!("{detail}\n"), Color::Red));
             code
         }
     }
+}
+
+/// Render an error and its full source chain as "top: cause: root-cause".
+fn full_chain(err: &anyhow::Error) -> String {
+    err.chain()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 fn aws_access_or_expired_hint(err: &anyhow::Error) -> Option<String> {
