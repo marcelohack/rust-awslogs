@@ -190,8 +190,11 @@ pub async fn run() -> i32 {
         return 1;
     };
 
-    let mut stdout = io::stdout().lock();
-    let mut stderr = io::stderr().lock();
+    // Unlocked handles: holding a StdoutLock across the `--watch` loop would
+    // deadlock the Ctrl-C handler (which also writes to stdout). These lock
+    // per write instead.
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
     let factory: ClientFactory = Box::new(|common: CommonAwsArgs| {
         Box::pin(async move {
             let opts = common.into_credential_options();

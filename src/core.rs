@@ -132,7 +132,7 @@ impl AwsLogs {
 
     /// `awslogs groups` — write each group on its own line.
     pub async fn list_groups(&self) -> Result<(), AwsLogsError> {
-        let mut stdout = io::stdout().lock();
+        let mut stdout = io::stdout();
         self.list_groups_into(&mut stdout).await
     }
 
@@ -145,7 +145,7 @@ impl AwsLogs {
 
     /// `awslogs streams GROUP` — write each stream on its own line.
     pub async fn list_streams(&self) -> Result<(), AwsLogsError> {
-        let mut stdout = io::stdout().lock();
+        let mut stdout = io::stdout();
         self.list_streams_into(&mut stdout).await
     }
 
@@ -210,7 +210,11 @@ impl AwsLogs {
 
     /// `awslogs get GROUP [STREAM_EXPR]`
     pub async fn list_logs(&self) -> Result<(), AwsLogsError> {
-        let mut stdout = io::stdout().lock();
+        // Use an unlocked stdout handle: it locks per write and releases
+        // between lines. Holding a StdoutLock across the (potentially infinite)
+        // `--watch` loop would deadlock the Ctrl-C handler, which also writes to
+        // stdout and would block forever waiting for the lock.
+        let mut stdout = io::stdout();
         self.list_logs_into(&mut stdout).await
     }
 
