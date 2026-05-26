@@ -212,6 +212,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-kinesis"
+version = "1.78.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f40c5352ced77b5b0d7415614c4affdf7d0d3a39f3de389f1e65c3e3c840d93a"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-eventstream",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-sso"
 version = "1.90.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -502,6 +525,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-cloudwatchlogs",
+ "aws-sdk-kinesis",
  "aws-types",
  "chrono",
  "clap",

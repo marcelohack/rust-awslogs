@@ -51,7 +51,7 @@ pub enum ColorPreference {
 }
 
 impl ColorPreference {
-    fn enabled(self) -> bool {
+    pub(crate) fn enabled(self) -> bool {
         match self {
             ColorPreference::Always => true,
             ColorPreference::Never => false,
@@ -369,7 +369,7 @@ impl AwsLogs {
     }
 }
 
-fn ljust(text: &str, width: usize) -> String {
+pub(crate) fn ljust(text: &str, width: usize) -> String {
     if text.chars().count() >= width {
         text.to_string()
     } else {
@@ -383,7 +383,7 @@ fn ljust(text: &str, width: usize) -> String {
     }
 }
 
-fn maybe_color(text: &str, color: Color, enabled: bool) -> String {
+pub(crate) fn maybe_color(text: &str, color: Color, enabled: bool) -> String {
     if enabled {
         ansi_colored(text, color)
     } else {
@@ -391,7 +391,7 @@ fn maybe_color(text: &str, color: Color, enabled: bool) -> String {
     }
 }
 
-fn rstrip(s: &str) -> &str {
+pub(crate) fn rstrip(s: &str) -> &str {
     s.trim_end_matches(|c: char| c.is_whitespace())
 }
 

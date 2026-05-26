@@ -8,7 +8,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use awslogs::cli::{Cli, Command, CommonAwsArgs};
-use awslogs::client::{FilterParams, FilterResponse, LogEvent, LogsClient, StreamMeta};
+use awslogs::client::{
+    FilterParams, FilterResponse, GetRecordsResponse, KinesisClient, KinesisRecord, LogEvent,
+    LogsClient, ShardInfo, ShardIteratorPosition, StreamMeta,
+};
 use awslogs::core::{
     ALL_WILDCARD, AwsLogs, AwsLogsConfig, ColorPreference, filter_streams_by_window,
 };
@@ -92,6 +95,88 @@ impl LogsClient for MockLogsClient {
     }
 }
 
+// ──────────────────────── mock kinesis client ─────────────────────────────────
+
+#[derive(Default)]
+pub struct MockKinesisClient {
+    shards: Mutex<Vec<String>>,
+    records: Mutex<HashMap<String, Vec<KinesisRecord>>>,
+}
+
+impl MockKinesisClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_shards(self, shards: impl IntoIterator<Item = &'static str>) -> Self {
+        *self.shards.lock().unwrap() = shards.into_iter().map(String::from).collect();
+        self
+    }
+
+    pub fn with_records(self, shard_id: &str, records: Vec<KinesisRecord>) -> Self {
+        self.records
+            .lock()
+            .unwrap()
+            .insert(shard_id.to_string(), records);
+        self
+    }
+}
+
+#[async_trait]
+impl KinesisClient for MockKinesisClient {
+    async fn list_shards(&self, _stream_name: &str) -> Result<Vec<ShardInfo>, anyhow::Error> {
+        Ok(self
+            .shards
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|shard_id| ShardInfo {
+                shard_id: shard_id.clone(),
+            })
+            .collect())
+    }
+
+    async fn get_shard_iterator(
+        &self,
+        _stream_name: &str,
+        shard_id: &str,
+        _position: &ShardIteratorPosition,
+    ) -> Result<Option<String>, anyhow::Error> {
+        // The iterator token is just the shard id; one GetRecords call drains it.
+        Ok(Some(shard_id.to_string()))
+    }
+
+    async fn get_records(
+        &self,
+        shard_id: &str,
+        _shard_iterator: &str,
+        _limit: Option<i32>,
+    ) -> Result<GetRecordsResponse, anyhow::Error> {
+        let records = self
+            .records
+            .lock()
+            .unwrap()
+            .get(shard_id)
+            .cloned()
+            .unwrap_or_default();
+        Ok(GetRecordsResponse {
+            records,
+            next_shard_iterator: None,
+            millis_behind_latest: Some(0),
+        })
+    }
+}
+
+fn krecord(shard_id: &str, ts: i64, data: &str) -> KinesisRecord {
+    KinesisRecord {
+        shard_id: shard_id.to_string(),
+        sequence_number: "0".to_string(),
+        partition_key: "pk".to_string(),
+        approximate_arrival_timestamp: Some(ts),
+        data: data.as_bytes().to_vec(),
+    }
+}
+
 // ────────────────────────── small helpers ─────────────────────────────────────
 
 fn stream(name: &str) -> StreamMeta {
@@ -163,7 +248,7 @@ fn parse_argv(argv: &[&str]) -> Command {
 /// Run a parsed [`Command`] through the CLI pipeline with a mock client.
 /// Returns (exit_code, stdout_bytes, stderr_bytes).
 async fn run_cli(argv: &[&str], client: Arc<dyn LogsClient>) -> (i32, Vec<u8>, Vec<u8>) {
-    use awslogs::cli::{ClientFactory, execute};
+    use awslogs::cli::{ClientFactory, KinesisClientFactory, execute};
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -172,7 +257,31 @@ async fn run_cli(argv: &[&str], client: Arc<dyn LogsClient>) -> (i32, Vec<u8>, V
         let client = client.clone();
         Box::pin(async move { Ok(client) })
     });
-    let code = execute(command, &mut stdout, &mut stderr, factory).await;
+    // Log commands never invoke the Kinesis factory; supply one that panics if
+    // it ever runs so a routing mistake is caught loudly.
+    let kinesis: KinesisClientFactory = Box::new(|_common: CommonAwsArgs| {
+        Box::pin(async move { panic!("log command unexpectedly built a Kinesis client") })
+    });
+    let code = execute(command, &mut stdout, &mut stderr, factory, kinesis).await;
+    (code, stdout, stderr)
+}
+
+/// Kinesis counterpart to [`run_cli`]: routes a `kinesis ...` argv through the
+/// CLI with a mock Kinesis client.
+async fn run_kinesis_cli(argv: &[&str], client: Arc<dyn KinesisClient>) -> (i32, Vec<u8>, Vec<u8>) {
+    use awslogs::cli::{ClientFactory, KinesisClientFactory, execute};
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let command = parse_argv(argv);
+    let logs: ClientFactory = Box::new(|_common: CommonAwsArgs| {
+        Box::pin(async move { panic!("kinesis command unexpectedly built a logs client") })
+    });
+    let kinesis: KinesisClientFactory = Box::new(move |_common: CommonAwsArgs| {
+        let client = client.clone();
+        Box::pin(async move { Ok(client) })
+    });
+    let code = execute(command, &mut stdout, &mut stderr, logs, kinesis).await;
     (code, stdout, stderr)
 }
 
@@ -636,4 +745,166 @@ async fn test_too_many_streams_returns_code_6() {
 #[tokio::test]
 async fn test_color_preference_default_is_auto() {
     assert_eq!(AwsLogsConfig::default().color, ColorPreference::Auto);
+}
+
+// ─────────────────────────────── kinesis ──────────────────────────────────────
+
+fn kinesis_two_shard_client() -> Arc<MockKinesisClient> {
+    Arc::new(
+        MockKinesisClient::new()
+            .with_shards(["shardId-0", "shardId-1"])
+            .with_records(
+                "shardId-0",
+                vec![
+                    krecord("shardId-0", 1000, "hello from zero"),
+                    krecord("shardId-0", 3000, "error: boom on zero"),
+                ],
+            )
+            .with_records(
+                "shardId-1",
+                vec![
+                    krecord("shardId-1", 2000, "hello from one"),
+                    krecord("shardId-1", 4000, "error: boom on one"),
+                ],
+            ),
+    )
+}
+
+#[tokio::test]
+async fn test_kinesis_shards_lists_every_shard() {
+    let client = kinesis_two_shard_client();
+    let (code, stdout, _stderr) =
+        run_kinesis_cli(&["awslogs", "kinesis", "shards", "my-stream"], client).await;
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8(stdout).unwrap(), "shardId-0\nshardId-1\n");
+}
+
+#[tokio::test]
+async fn test_kinesis_search_reads_all_shards() {
+    let client = kinesis_two_shard_client();
+    let (code, stdout, _stderr) = run_kinesis_cli(
+        &["awslogs", "kinesis", "search", "my-stream", "--no-shard"],
+        client,
+    )
+    .await;
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8(stdout).unwrap(),
+        "hello from zero\nerror: boom on zero\nhello from one\nerror: boom on one\n"
+    );
+}
+
+#[tokio::test]
+async fn test_kinesis_search_substring_filter() {
+    let client = kinesis_two_shard_client();
+    let (code, stdout, _stderr) = run_kinesis_cli(
+        &[
+            "awslogs",
+            "kinesis",
+            "search",
+            "my-stream",
+            "--no-shard",
+            "-f",
+            "error:",
+        ],
+        client,
+    )
+    .await;
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8(stdout).unwrap(),
+        "error: boom on zero\nerror: boom on one\n"
+    );
+}
+
+#[tokio::test]
+async fn test_kinesis_search_regex_filter() {
+    let client = kinesis_two_shard_client();
+    let (code, stdout, _stderr) = run_kinesis_cli(
+        &[
+            "awslogs",
+            "kinesis",
+            "search",
+            "my-stream",
+            "--no-shard",
+            "--regex",
+            "-f",
+            "boom on (zero|one)$",
+        ],
+        client,
+    )
+    .await;
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8(stdout).unwrap(),
+        "error: boom on zero\nerror: boom on one\n"
+    );
+}
+
+#[tokio::test]
+async fn test_kinesis_search_includes_shard_id_by_default() {
+    let client = Arc::new(
+        MockKinesisClient::new()
+            .with_shards(["shardId-0"])
+            .with_records("shardId-0", vec![krecord("shardId-0", 1000, "payload")]),
+    );
+    let (code, stdout, _stderr) =
+        run_kinesis_cli(&["awslogs", "kinesis", "search", "my-stream"], client).await;
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8(stdout).unwrap(), "shardId-0 payload\n");
+}
+
+#[tokio::test]
+async fn test_kinesis_search_end_time_stops_reading() {
+    let client = kinesis_two_shard_client();
+    // End at 2s: keeps the 1000ms/2000ms records, drops the 3000ms/4000ms ones.
+    let (code, stdout, _stderr) = run_kinesis_cli(
+        &[
+            "awslogs",
+            "kinesis",
+            "search",
+            "my-stream",
+            "--no-shard",
+            "-e",
+            "1970-01-01T00:00:02Z",
+        ],
+        client,
+    )
+    .await;
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8(stdout).unwrap(),
+        "hello from zero\nhello from one\n"
+    );
+}
+
+#[tokio::test]
+async fn test_kinesis_search_jmespath_query_on_json() {
+    let client = Arc::new(
+        MockKinesisClient::new()
+            .with_shards(["shardId-0"])
+            .with_records(
+                "shardId-0",
+                vec![krecord(
+                    "shardId-0",
+                    1000,
+                    r#"{"level":"error","msg":"disk full"}"#,
+                )],
+            ),
+    );
+    let (code, stdout, _stderr) = run_kinesis_cli(
+        &[
+            "awslogs",
+            "kinesis",
+            "search",
+            "my-stream",
+            "--no-shard",
+            "-q",
+            "msg",
+        ],
+        client,
+    )
+    .await;
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8(stdout).unwrap(), "disk full\n");
 }

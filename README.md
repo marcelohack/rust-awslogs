@@ -1,8 +1,8 @@
 # awslogs (Rust)
 
-A Rust port of [`jorgebastida/awslogs`](https://github.com/jorgebastida/awslogs) — a small command-line tool for querying groups, streams, and events from [Amazon CloudWatch Logs](https://aws.amazon.com/cloudwatch/).
+A Rust port of [`jorgebastida/awslogs`](https://github.com/jorgebastida/awslogs) — a small command-line tool for querying groups, streams, and events from [Amazon CloudWatch Logs](https://aws.amazon.com/cloudwatch/), extended with a `kinesis` command for searching [Kinesis data streams](#kinesis-data-streams).
 
-This is a single-binary reimplementation built on the [AWS SDK for Rust](https://aws.amazon.com/sdk-for-rust/) (`aws-sdk-cloudwatchlogs`). The CLI surface, exit codes, color output, dedup behavior, and time expressions are kept byte-for-byte compatible with the Python original wherever possible; the integration test suite is ported from upstream so this binary passes the same assertions.
+This is a single-binary reimplementation built on the [AWS SDK for Rust](https://aws.amazon.com/sdk-for-rust/) (`aws-sdk-cloudwatchlogs` and `aws-sdk-kinesis`). The CLI surface, exit codes, color output, dedup behavior, and time expressions are kept byte-for-byte compatible with the Python original wherever possible; the integration test suite is ported from upstream so this binary passes the same assertions.
 
 One of the most powerful features is querying events from several streams and consuming them (ordered) in pseudo-realtime with your favourite tools such as `grep`:
 
@@ -37,13 +37,15 @@ cargo run --release -- get /var/log/syslog ALL --start='1h ago'
 ## Commands
 
 ```text
-awslogs [ get | groups | streams ]
+awslogs [ get | groups | streams | kinesis ]
 ```
 
 * `awslogs groups` — list existing groups
 * `awslogs streams GROUP` — list existing streams within `GROUP`
 * `awslogs get GROUP [STREAM_EXPRESSION]` — get logs matching `STREAM_EXPRESSION` in `GROUP`.
   * Expressions are regular expressions (anchored at the start), or the literal `ALL` as a shortcut for `.*`.
+* `awslogs kinesis shards STREAM` — list the shards of a Kinesis data stream
+* `awslogs kinesis search STREAM` — read and search records across every shard of a Kinesis data stream (see [Kinesis data streams](#kinesis-data-streams))
 
 You must supply a region via `--aws-region` or the `AWS_REGION` env var (or have one configured in your AWS profile).
 
@@ -126,6 +128,58 @@ streaming output through a pipe.
 
 ---
 
+## Kinesis data streams
+
+`awslogs kinesis` searches [Amazon Kinesis Data Streams](https://aws.amazon.com/kinesis/data-streams/). Unlike CloudWatch Logs, Kinesis has **no server-side filtering** — there is no `filter_log_events` equivalent. So `search` enumerates the stream's shards (`ListShards`), reads records within the requested time window (`GetShardIterator` + `GetRecords`), and matches each record's payload **locally**. Shards are read sequentially, which keeps the tool inside the per-shard `GetRecords` rate limit.
+
+```bash
+# List the shards of a stream
+awslogs kinesis shards my-stream
+
+# Read every record on every shard (from the oldest retained record)
+awslogs kinesis search my-stream
+
+# Substring search (the default) across all shards
+awslogs kinesis search my-stream -f 'order-id'
+
+# Regular-expression search
+awslogs kinesis search my-stream --regex -f 'user_id":\s*42'
+
+# Restrict the time window (records arriving after --end stop the read)
+awslogs kinesis search my-stream -s '1h ago' -e '10m ago'
+
+# Tail new records in real time
+awslogs kinesis search my-stream --watch
+
+# Limit to specific shards (repeatable)
+awslogs kinesis search my-stream --shard-id shardId-000000000000 --shard-id shardId-000000000001
+
+# Reshape JSON records with JMESPath, and drop the shard column
+awslogs kinesis search my-stream -S -q 'detail.message'
+```
+
+Record payloads are decoded as UTF-8 (lossily — invalid bytes become `�`).
+
+Options:
+
+| Flag | Effect |
+|---|---|
+| `-f`, `--filter-pattern` | Pattern to match against each record. Substring match by default. |
+| `--regex` | Treat `--filter-pattern` as a regular expression instead of a literal substring. |
+| `--shard-id` | Only read the given shard(s). Repeatable. Defaults to every shard. |
+| `-s`, `--start` | Window start. Omitted ⇒ oldest retained record (`TRIM_HORIZON`). Accepts the same forms as [Time options](#time-options---start----end). |
+| `-e`, `--end` | Window end. Records arriving after this stop the read. |
+| `-w`, `--watch` | Keep polling for new records (see [Watching](#watching)). |
+| `-i`, `--watch-interval` | Seconds between polls in `--watch` mode (default 1). |
+| `-S`, `--no-shard` | Don't print the shard-id column. |
+| `--timestamp` | Prepend the record's approximate arrival timestamp. |
+| `-q`, `--query` | Apply a [JMESPath](https://jmespath.org) expression to JSON record payloads. |
+| `--color WHEN` | `auto` (default), `always`, `never`. |
+
+> **Note:** `--filter-pattern` here is a plain substring/regex match, *not* the CloudWatch Logs filter-pattern syntax used by `awslogs get`, because Kinesis records are matched client-side.
+
+---
+
 ## Output control
 
 | Flag | Effect |
@@ -160,7 +214,7 @@ The recommended setup is to configure the AWS CLI once and let `awslogs` reuse t
 
 ### Required IAM permissions
 
-The managed policy `CloudWatchLogsReadOnlyAccess` is sufficient. Equivalent inline policy:
+For the log commands, the managed policy `CloudWatchLogsReadOnlyAccess` is sufficient. Equivalent inline policy:
 
 ```json
 {
@@ -175,6 +229,23 @@ The managed policy `CloudWatchLogsReadOnlyAccess` is sufficient. Equivalent inli
       "logs:StopQuery",
       "logs:TestMetricFilter",
       "logs:FilterLogEvents"
+    ],
+    "Resource": "*"
+  }]
+}
+```
+
+The `kinesis` commands additionally need read access to the data stream:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "kinesis:ListShards",
+      "kinesis:GetShardIterator",
+      "kinesis:GetRecords"
     ],
     "Resource": "*"
   }]

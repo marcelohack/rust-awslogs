@@ -6,9 +6,12 @@ use std::time::Duration;
 
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
-use crate::client::{AwsCredentialOptions, AwsLogsClient, LogsClient};
+use crate::client::{
+    AwsCredentialOptions, AwsKinesisClient, AwsLogsClient, KinesisClient, LogsClient,
+};
 use crate::core::{AwsLogs, AwsLogsConfig, Color, ColorPreference, ansi_colored};
 use crate::exceptions::AwsLogsError;
+use crate::kinesis::{KinesisSearch, KinesisSearchConfig};
 use crate::time::parse_datetime;
 
 /// Read AWS CloudWatch logs from the command line.
@@ -16,7 +19,7 @@ use crate::time::parse_datetime;
 #[command(
     name = "awslogs",
     version,
-    about = "awslogs [ get | groups | streams ]",
+    about = "awslogs [ get | groups | streams | kinesis ]",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -32,6 +35,8 @@ pub enum Command {
     Groups(GroupsArgs),
     /// List streams
     Streams(StreamsArgs),
+    /// Search Kinesis data streams
+    Kinesis(KinesisArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -176,6 +181,82 @@ pub struct StreamsArgs {
     pub common: CommonAwsArgs,
 }
 
+#[derive(Debug, Args)]
+pub struct KinesisArgs {
+    #[command(subcommand)]
+    pub command: KinesisCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KinesisCommand {
+    /// Search records across all shards of a data stream
+    Search(KinesisSearchArgs),
+    /// List shards of a data stream
+    Shards(KinesisShardsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct KinesisSearchArgs {
+    /// Kinesis data stream name
+    pub stream_name: String,
+
+    /// Pattern to match against each record (substring by default)
+    #[arg(short = 'f', long = "filter-pattern")]
+    pub filter_pattern: Option<String>,
+
+    /// Treat the filter pattern as a regular expression
+    #[arg(long = "regex", action = ArgAction::SetTrue)]
+    pub regex: bool,
+
+    /// Only read these shards (repeatable); defaults to every shard
+    #[arg(long = "shard-id", value_name = "SHARD_ID", action = ArgAction::Append)]
+    pub shard_ids: Vec<String>,
+
+    /// Query for new records constantly
+    #[arg(short = 'w', long = "watch", action = ArgAction::SetTrue)]
+    pub watch: bool,
+
+    /// Interval in seconds at which to query for new records
+    #[arg(short = 'i', long = "watch-interval", default_value_t = 1)]
+    pub watch_interval: u64,
+
+    /// Do not display shard id
+    #[arg(short = 'S', long = "no-shard", action = ArgAction::SetFalse)]
+    pub output_shard_enabled: bool,
+
+    /// Add the record's approximate arrival timestamp to the output
+    #[arg(long = "timestamp", action = ArgAction::SetTrue)]
+    pub output_timestamp_enabled: bool,
+
+    /// Start time (default: oldest record in the stream)
+    #[arg(short = 's', long = "start")]
+    pub start: Option<String>,
+
+    /// End time
+    #[arg(short = 'e', long = "end")]
+    pub end: Option<String>,
+
+    /// When to color output: auto (default), never, always.
+    #[arg(long = "color", value_name = "WHEN", default_value_t = ColorWhen::Auto, value_enum)]
+    pub color: ColorWhen,
+
+    /// JMESPath query to use in filtering JSON records
+    #[arg(short = 'q', long = "query")]
+    pub query: Option<String>,
+
+    #[command(flatten)]
+    pub common: CommonAwsArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct KinesisShardsArgs {
+    /// Kinesis data stream name
+    pub stream_name: String,
+
+    #[command(flatten)]
+    pub common: CommonAwsArgs,
+}
+
 /// Production entry point invoked from `main`.
 pub async fn run() -> i32 {
     let cli = match Cli::try_parse() {
@@ -195,7 +276,7 @@ pub async fn run() -> i32 {
     // per write instead.
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
-    let factory: ClientFactory = Box::new(|common: CommonAwsArgs| {
+    let logs_factory: ClientFactory = Box::new(|common: CommonAwsArgs| {
         Box::pin(async move {
             let opts = common.into_credential_options();
             let client = AwsLogsClient::new(&opts).await.map_err(AwsLogsError::Aws)?;
@@ -203,7 +284,24 @@ pub async fn run() -> i32 {
             Ok(arc)
         })
     });
-    execute(command, &mut stdout, &mut stderr, factory).await
+    let kinesis_factory: KinesisClientFactory = Box::new(|common: CommonAwsArgs| {
+        Box::pin(async move {
+            let opts = common.into_credential_options();
+            let client = AwsKinesisClient::new(&opts)
+                .await
+                .map_err(AwsLogsError::Aws)?;
+            let arc: Arc<dyn KinesisClient> = Arc::new(client);
+            Ok(arc)
+        })
+    });
+    execute(
+        command,
+        &mut stdout,
+        &mut stderr,
+        logs_factory,
+        kinesis_factory,
+    )
+    .await
 }
 
 /// Boxed async factory returning a [`LogsClient`] — abstracted so integration
@@ -216,6 +314,19 @@ pub type ClientFactory = Box<
         > + Send,
 >;
 
+/// Boxed async factory returning a [`KinesisClient`] — the Kinesis counterpart
+/// to [`ClientFactory`], so tests can inject a mock Kinesis client.
+pub type KinesisClientFactory = Box<
+    dyn FnOnce(
+            CommonAwsArgs,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Arc<dyn KinesisClient>, AwsLogsError>>
+                    + Send,
+            >,
+        > + Send,
+>;
+
 /// Run a parsed [`Command`] writing output to `stdout` and errors to `stderr`.
 /// Returns the same exit code the Python CLI would have produced.
 pub async fn execute<O: Write, E: Write>(
@@ -223,11 +334,20 @@ pub async fn execute<O: Write, E: Write>(
     stdout: &mut O,
     stderr: &mut E,
     make_client: ClientFactory,
+    make_kinesis_client: KinesisClientFactory,
 ) -> i32 {
     let result: Result<(), AwsLogsError> = match command {
         Command::Get(args) => run_get(args, stdout, make_client).await,
         Command::Groups(args) => run_groups(args, stdout, make_client).await,
         Command::Streams(args) => run_streams(args, stdout, make_client).await,
+        Command::Kinesis(args) => match args.command {
+            KinesisCommand::Search(args) => {
+                run_kinesis_search(args, stdout, make_kinesis_client).await
+            }
+            KinesisCommand::Shards(args) => {
+                run_kinesis_shards(args, stdout, make_kinesis_client).await
+            }
+        },
     };
     handle_result(result, stderr)
 }
@@ -348,4 +468,50 @@ async fn run_streams<O: Write>(
     };
     let client = make_client(args.common).await?;
     AwsLogs::new(cfg, client)?.list_streams_into(writer).await
+}
+
+async fn run_kinesis_search<O: Write>(
+    args: KinesisSearchArgs,
+    writer: &mut O,
+    make_client: KinesisClientFactory,
+) -> Result<(), AwsLogsError> {
+    let start = match args.start {
+        Some(s) => parse_datetime(Some(&s))?,
+        None => None,
+    };
+    let end = match args.end {
+        Some(s) => parse_datetime(Some(&s))?,
+        None => None,
+    };
+    let cfg = KinesisSearchConfig {
+        stream_name: args.stream_name,
+        filter_pattern: args.filter_pattern,
+        regex: args.regex,
+        shard_ids: args.shard_ids,
+        start,
+        end,
+        watch: args.watch,
+        watch_interval: Duration::from_secs(args.watch_interval),
+        color: args.color.into(),
+        output_shard_enabled: args.output_shard_enabled,
+        output_timestamp_enabled: args.output_timestamp_enabled,
+        query: args.query,
+    };
+    let client = make_client(args.common).await?;
+    KinesisSearch::new(cfg, client)?.search_into(writer).await
+}
+
+async fn run_kinesis_shards<O: Write>(
+    args: KinesisShardsArgs,
+    writer: &mut O,
+    make_client: KinesisClientFactory,
+) -> Result<(), AwsLogsError> {
+    let cfg = KinesisSearchConfig {
+        stream_name: args.stream_name,
+        ..Default::default()
+    };
+    let client = make_client(args.common).await?;
+    KinesisSearch::new(cfg, client)?
+        .list_shards_into(writer)
+        .await
 }
