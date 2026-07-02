@@ -38,7 +38,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::AbortHandle;
 
@@ -781,13 +781,20 @@ impl App {
         }
     }
 
-    fn output_back(&mut self) {
+    /// Abort the in-flight command (if any) and invalidate its late messages.
+    /// Bumping `req` means any `Line`/`Done`/`Error` still in the channel from
+    /// the aborted task is ignored by `on_msg`.
+    fn cancel_current(&mut self) {
         if let Some(abort) = self.abort.take() {
             abort.abort();
         }
-        self.req += 1; // invalidate any late messages from the aborted task
-        self.watching = false;
+        self.req += 1;
         self.loading = false;
+    }
+
+    fn output_back(&mut self) {
+        self.cancel_current();
+        self.watching = false;
         self.pane = Pane::List;
     }
 
@@ -836,6 +843,10 @@ impl App {
     }
 
     fn open_stream_input(&mut self) {
+        // Leaving whatever CloudWatch view was active: stop its task so a live
+        // `--watch` tail doesn't keep polling in the background.
+        self.cancel_current();
+        self.watching = false;
         self.category = Category::Kinesis;
         self.pane = Pane::Input;
         self.input_kind = InputKind::KinesisStream;
@@ -918,6 +929,38 @@ impl App {
         }
     }
 
+    /// Placeholder text shown when a list came back empty (not while loading).
+    fn list_empty_hint(&self) -> &'static str {
+        match self.category {
+            Category::CloudWatch => {
+                if self.cw_group.is_some() {
+                    "  No streams in this log group."
+                } else {
+                    "  No log groups found."
+                }
+            }
+            Category::Kinesis => "  No shards found for this stream.",
+        }
+    }
+
+    /// Placeholder text shown when a log/record view produced no lines (not
+    /// while loading) — distinguishes "nothing here" from an error.
+    fn output_empty_hint(&self) -> String {
+        let what = match self.category {
+            Category::CloudWatch => {
+                if self.cw_stream_sel.is_some() {
+                    "No log events found for this stream."
+                } else {
+                    "No log events in the last 30 minutes for this group."
+                }
+            }
+            Category::Kinesis => "No matching records in the selected window.",
+        };
+        format!(
+            "  {what}\n\n  Press  w  to watch (live tail)   ·   /  to filter   ·   Esc  to go back."
+        )
+    }
+
     fn draw(&mut self, f: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -945,14 +988,29 @@ impl App {
         f.render_widget(tabs, chunks[0]);
 
         // Main content.
+        let title = match self.pane {
+            Pane::List if !self.items.is_empty() => {
+                format!(" {} ({}) ", self.list_title, self.items.len())
+            }
+            _ => format!(" {} ", self.main_title()),
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(format!(" {} ", self.main_title()))
+            .title(title)
             .title_bottom(Line::from(self.key_hints()).right_aligned());
         let area = chunks[1];
         self.viewport_height = area.height.saturating_sub(2) as usize;
+        let dim = Style::default().fg(Color::DarkGray);
 
         match self.pane {
+            Pane::List if self.items.is_empty() => {
+                let msg = if self.loading {
+                    "  Loading…".to_string()
+                } else {
+                    self.list_empty_hint().to_string()
+                };
+                f.render_widget(Paragraph::new(msg).block(block).style(dim), area);
+            }
             Pane::List => {
                 let items: Vec<ListItem> = self
                     .items
@@ -964,6 +1022,20 @@ impl App {
                     .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
                     .highlight_symbol("› ");
                 f.render_stateful_widget(list, area, &mut self.list_state);
+            }
+            Pane::Output if self.output.is_empty() => {
+                let msg = if self.loading {
+                    "  Loading…".to_string()
+                } else {
+                    self.output_empty_hint()
+                };
+                f.render_widget(
+                    Paragraph::new(msg)
+                        .block(block)
+                        .style(dim)
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
             }
             Pane::Output => {
                 let total = self.output.len();
