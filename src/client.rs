@@ -9,6 +9,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_cloudwatchlogs::Client as SdkClient;
 use aws_sdk_cloudwatchlogs::config::Region;
 use aws_sdk_kinesis::Client as KinesisSdkClient;
+use aws_sdk_sts::Client as StsSdkClient;
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamMeta {
@@ -302,6 +303,55 @@ impl AwsKinesisClient {
         let cfg = builder.build();
         Ok(Self {
             inner: KinesisSdkClient::from_conf(cfg),
+        })
+    }
+}
+
+// ─────────────────────────────── Identity (STS) ───────────────────────────────
+
+/// The caller's AWS identity, used by the TUI status bar.
+#[derive(Debug, Clone, Default)]
+pub struct CallerIdentity {
+    pub account_id: String,
+    /// Resolved region for the session (may be empty if none was configured).
+    pub region: String,
+}
+
+/// The single STS operation awslogs needs: resolve the caller's account id.
+#[async_trait]
+pub trait IdentityClient: Send + Sync {
+    async fn caller_identity(&self) -> Result<CallerIdentity, anyhow::Error>;
+}
+
+/// Real client that talks to AWS STS.
+pub struct AwsStsClient {
+    inner: StsSdkClient,
+    region: String,
+}
+
+impl AwsStsClient {
+    pub async fn new(opts: &AwsCredentialOptions) -> anyhow::Result<Self> {
+        let shared = load_shared_config(opts).await;
+        let region = shared.region().map(|r| r.to_string()).unwrap_or_default();
+        let mut builder = aws_sdk_sts::config::Builder::from(&shared);
+        if let Some(url) = &opts.endpoint_url {
+            builder = builder.endpoint_url(url);
+        }
+        let cfg = builder.build();
+        Ok(Self {
+            inner: StsSdkClient::from_conf(cfg),
+            region,
+        })
+    }
+}
+
+#[async_trait]
+impl IdentityClient for AwsStsClient {
+    async fn caller_identity(&self) -> Result<CallerIdentity, anyhow::Error> {
+        let resp = self.inner.get_caller_identity().send().await?;
+        Ok(CallerIdentity {
+            account_id: resp.account.unwrap_or_default(),
+            region: self.region.clone(),
         })
     }
 }
