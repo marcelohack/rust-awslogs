@@ -49,6 +49,7 @@ use crate::client::{
 use crate::core::{AwsLogs, AwsLogsConfig, ColorPreference};
 use crate::exceptions::AwsLogsError;
 use crate::kinesis::{KinesisSearch, KinesisSearchConfig};
+use crate::time::parse_datetime;
 
 /// Synthetic list entry meaning "every stream in this group".
 const ALL_STREAMS: &str = "[ALL streams]";
@@ -78,6 +79,8 @@ enum EngineCmd {
         stream: Option<String>, // None == ALL
         filter: Option<String>,
         watch: bool,
+        start: Option<i64>,
+        end: Option<i64>,
     },
     Shards {
         req: u64,
@@ -89,6 +92,8 @@ enum EngineCmd {
         shard: Option<String>, // None == all shards
         filter: Option<String>,
         watch: bool,
+        start: Option<i64>,
+        end: Option<i64>,
     },
 }
 
@@ -134,6 +139,8 @@ enum InputKind {
     KinesisStream,
     CwFilter,
     KinFilter,
+    StartTime,
+    EndTime,
 }
 
 /// A `Write` sink that forwards each completed line to the UI over a channel.
@@ -315,23 +322,20 @@ fn build_future(
             stream,
             filter,
             watch,
+            start,
+            end,
         } => Box::pin(async move {
             // A specific stream is queried by exact name (no pattern/window
-            // filtering) and with no lower time bound, so its full history is
-            // shown regardless of how long it has been idle. When watching, a
-            // lookback bound keeps each poll cheap. "ALL streams" keeps the
-            // lookback window to avoid flooding the whole group.
+            // filtering) so it is never dropped for being idle; the time window
+            // is resolved by the caller (see `App::load_logs`).
             let explicit_streams = stream.as_ref().map(|s| vec![s.clone()]);
-            let start = match (&stream, watch) {
-                (Some(_), false) => None,
-                _ => Some(now_minus_minutes(DEFAULT_LOOKBACK_MIN)),
-            };
             let cfg = AwsLogsConfig {
                 log_group_name: Some(group),
                 log_stream_name: Some(stream.unwrap_or_else(|| "ALL".to_string())),
                 explicit_streams,
                 filter_pattern: filter,
                 start,
+                end,
                 watch,
                 color: ColorPreference::Never,
                 output_group_enabled: false,
@@ -374,12 +378,15 @@ fn build_future(
             shard,
             filter,
             watch,
+            start,
+            end,
         } => Box::pin(async move {
             let cfg = KinesisSearchConfig {
                 stream_name: stream,
                 filter_pattern: filter,
                 shard_ids: shard.map(|s| vec![s]).unwrap_or_default(),
-                start: Some(now_minus_minutes(DEFAULT_LOOKBACK_MIN)),
+                start,
+                end,
                 watch,
                 color: ColorPreference::Never,
                 output_shard_enabled: true,
@@ -419,17 +426,28 @@ struct App {
     kin_shard_sel: Option<String>, // None == all shards
     kin_filter: Option<String>,
 
+    // Time window applied to log/record views. `None` means "use the per-view
+    // default". Stored as the raw expression (e.g. "5m", "2h", an absolute
+    // date) so relative windows stay relative and re-resolve on each query.
+    start_expr: Option<String>,
+    end_expr: Option<String>,
+
     // List pane.
     items: Vec<String>,
     list_state: ListState,
     list_title: String,
+    // Type-to-filter (fast-find) within the current list.
+    list_filter: String,
+    list_filtering: bool,
 
     // Output pane.
     output: Vec<String>,
     output_title: String,
     follow: bool,
     scroll: usize,
+    hscroll: usize,
     viewport_height: usize,
+    max_line_len: usize,
 
     // Input pane.
     input: String,
@@ -460,14 +478,20 @@ impl App {
             kin_stream: None,
             kin_shard_sel: None,
             kin_filter: None,
+            start_expr: None,
+            end_expr: None,
             items: Vec::new(),
             list_state: ListState::default(),
             list_title: String::new(),
+            list_filter: String::new(),
+            list_filtering: false,
             output: Vec::new(),
             output_title: String::new(),
             follow: true,
             scroll: 0,
+            hscroll: 0,
             viewport_height: 1,
+            max_line_len: 0,
             input: String::new(),
             input_prompt: String::new(),
             input_kind: InputKind::KinesisStream,
@@ -494,6 +518,50 @@ impl App {
         let _ = self.cmd_tx.send(cmd);
     }
 
+    /// Resolve the configured time window (or `default_start` when the user has
+    /// not overridden the start). Relative expressions like "5m" re-resolve
+    /// against the current time on every query.
+    fn resolved_window(
+        &self,
+        default_start: Option<i64>,
+    ) -> Result<(Option<i64>, Option<i64>), AwsLogsError> {
+        let start = match &self.start_expr {
+            Some(expr) => parse_datetime(Some(expr))?,
+            None => default_start,
+        };
+        let end = match &self.end_expr {
+            Some(expr) => parse_datetime(Some(expr))?,
+            None => None,
+        };
+        Ok((start, end))
+    }
+
+    /// Indices of `items` that pass the active list filter (case-insensitive
+    /// substring). All items when no filter is set.
+    fn visible_indices(&self) -> Vec<usize> {
+        if self.list_filter.is_empty() {
+            return (0..self.items.len()).collect();
+        }
+        let needle = self.list_filter.to_lowercase();
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Reset the list selection to the first visible row (or none).
+    fn reselect_first(&mut self) {
+        let has_any = !self.visible_indices().is_empty();
+        self.list_state.select(if has_any { Some(0) } else { None });
+    }
+
+    fn clear_list_filter(&mut self) {
+        self.list_filter.clear();
+        self.list_filtering = false;
+    }
+
     // ── loaders ────────────────────────────────────────────────────────────
 
     fn load_groups(&mut self) {
@@ -503,6 +571,7 @@ impl App {
         self.cw_group = None;
         self.items.clear();
         self.list_state.select(None);
+        self.clear_list_filter();
         self.list_title = "CloudWatch · Groups".to_string();
         self.loading = true;
         self.status.clear();
@@ -516,6 +585,7 @@ impl App {
         self.cw_group = Some(group.clone());
         self.items.clear();
         self.list_state.select(None);
+        self.clear_list_filter();
         self.list_title = format!("CloudWatch · {group} · Streams");
         self.loading = true;
         self.status.clear();
@@ -524,12 +594,28 @@ impl App {
 
     /// `stream == None` means the group's whole stream set (`ALL`).
     fn load_logs(&mut self, group: String, stream: Option<String>) {
+        // A specific stream defaults to no lower bound (full history, since it
+        // was explicitly chosen); "ALL streams" and any watch keep a look-back
+        // window to avoid flooding / re-scanning. The user's `start_expr`/
+        // `end_expr` override the default.
+        let default_start = match (&stream, self.watching) {
+            (Some(_), false) => None,
+            _ => Some(now_minus_minutes(DEFAULT_LOOKBACK_MIN)),
+        };
+        let (start, end) = match self.resolved_window(default_start) {
+            Ok(window) => window,
+            Err(err) => {
+                self.status = format!("Error: {}", err.hint());
+                return;
+            }
+        };
         let req = self.start();
         self.category = Category::CloudWatch;
         self.pane = Pane::Output;
         self.output.clear();
         self.follow = true;
         self.scroll = 0;
+        self.hscroll = 0;
         let label = stream.clone().unwrap_or_else(|| "ALL".to_string());
         self.output_title = format!("CloudWatch · {group} · {label}");
         self.loading = true;
@@ -540,6 +626,8 @@ impl App {
             stream,
             filter: self.cw_filter.clone(),
             watch: self.watching,
+            start,
+            end,
         });
     }
 
@@ -550,6 +638,7 @@ impl App {
         self.kin_stream = Some(stream.clone());
         self.items.clear();
         self.list_state.select(None);
+        self.clear_list_filter();
         self.list_title = format!("Kinesis · {stream} · Shards");
         self.loading = true;
         self.status.clear();
@@ -558,12 +647,21 @@ impl App {
 
     /// `shard == None` means search across every shard.
     fn load_search(&mut self, stream: String, shard: Option<String>) {
+        let (start, end) = match self.resolved_window(Some(now_minus_minutes(DEFAULT_LOOKBACK_MIN)))
+        {
+            Ok(window) => window,
+            Err(err) => {
+                self.status = format!("Error: {}", err.hint());
+                return;
+            }
+        };
         let req = self.start();
         self.category = Category::Kinesis;
         self.pane = Pane::Output;
         self.output.clear();
         self.follow = true;
         self.scroll = 0;
+        self.hscroll = 0;
         let label = shard.clone().unwrap_or_else(|| "all shards".to_string());
         self.output_title = format!("Kinesis · {stream} · {label}");
         self.loading = true;
@@ -574,7 +672,28 @@ impl App {
             shard,
             filter: self.kin_filter.clone(),
             watch: self.watching,
+            start,
+            end,
         });
+    }
+
+    /// Re-run whichever log/record view is active (after a filter or window
+    /// change).
+    fn reload_output(&mut self) {
+        match self.category {
+            Category::CloudWatch => {
+                if let Some(group) = self.cw_group.clone() {
+                    let sel = self.cw_stream_sel.clone();
+                    self.load_logs(group, sel);
+                }
+            }
+            Category::Kinesis => {
+                if let Some(stream) = self.kin_stream.clone() {
+                    let shard = self.kin_shard_sel.clone();
+                    self.load_search(stream, shard);
+                }
+            }
+        }
     }
 
     // ── message handling ─────────────────────────────────────────────────────
@@ -594,8 +713,7 @@ impl App {
             }
             Msg::Items { req, items } if req == self.req => {
                 self.items = items;
-                self.list_state
-                    .select(if self.items.is_empty() { None } else { Some(0) });
+                self.reselect_first();
                 self.loading = false;
             }
             Msg::Line { req, line } if req == self.req => {
@@ -646,9 +764,39 @@ impl App {
     }
 
     fn on_key_list(&mut self, code: KeyCode) {
+        // Fast-find modal: printable keys edit the query; arrows navigate the
+        // filtered rows; Enter drills into the selection; Esc cancels.
+        if self.list_filtering {
+            match code {
+                KeyCode::Enter => {
+                    self.list_filtering = false;
+                    self.list_enter();
+                }
+                KeyCode::Esc => {
+                    self.clear_list_filter();
+                    self.reselect_first();
+                }
+                KeyCode::Backspace => {
+                    self.list_filter.pop();
+                    self.reselect_first();
+                }
+                KeyCode::Up => self.list_prev(),
+                KeyCode::Down => self.list_next(),
+                KeyCode::Char(c) => {
+                    self.list_filter.push(c);
+                    self.reselect_first();
+                }
+                _ => {}
+            }
+            return;
+        }
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Tab => self.switch_category(),
+            KeyCode::Char('/') => {
+                self.list_filter.clear();
+                self.list_filtering = true;
+            }
             KeyCode::Up | KeyCode::Char('k') => self.list_prev(),
             KeyCode::Down | KeyCode::Char('j') => self.list_next(),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.list_enter(),
@@ -680,14 +828,24 @@ impl App {
                 self.follow = false;
                 self.scroll_down(10);
             }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.hscroll = self.hscroll.saturating_sub(8);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let max = self.max_line_len.saturating_sub(1);
+                self.hscroll = (self.hscroll + 8).min(max);
+            }
             KeyCode::Char('g') => {
                 self.follow = false;
                 self.scroll = 0;
             }
             KeyCode::Char('G') => self.follow = true,
+            KeyCode::Char('0') => self.hscroll = 0,
             KeyCode::Char('w') => self.toggle_watch(),
             KeyCode::Char('/') => self.open_filter_input(),
-            KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => self.output_back(),
+            KeyCode::Char('s') => self.open_time_input(InputKind::StartTime),
+            KeyCode::Char('e') => self.open_time_input(InputKind::EndTime),
+            KeyCode::Esc | KeyCode::Backspace => self.output_back(),
             _ => {}
         }
     }
@@ -698,33 +856,39 @@ impl App {
     }
 
     fn list_prev(&mut self) {
-        if self.items.is_empty() {
+        let len = self.visible_indices().len();
+        if len == 0 {
             return;
         }
         let i = self
             .list_state
             .selected()
             .map_or(0, |i| i.saturating_sub(1));
-        self.list_state.select(Some(i));
+        self.list_state.select(Some(i.min(len - 1)));
     }
 
     fn list_next(&mut self) {
-        if self.items.is_empty() {
+        let len = self.visible_indices().len();
+        if len == 0 {
             return;
         }
         let i = match self.list_state.selected() {
-            Some(i) if i + 1 < self.items.len() => i + 1,
-            Some(i) => i,
+            Some(i) if i + 1 < len => i + 1,
+            Some(i) => i.min(len - 1),
             None => 0,
         };
         self.list_state.select(Some(i));
     }
 
     fn list_enter(&mut self) {
+        // The list selection indexes into the filtered (visible) rows; map it
+        // back to the underlying item.
+        let visible = self.visible_indices();
         let Some(item) = self
             .list_state
             .selected()
-            .and_then(|i| self.items.get(i).cloned())
+            .and_then(|i| visible.get(i))
+            .and_then(|&idx| self.items.get(idx).cloned())
         else {
             return;
         };
@@ -810,20 +974,7 @@ impl App {
 
     fn toggle_watch(&mut self) {
         self.watching = !self.watching;
-        match self.category {
-            Category::CloudWatch => {
-                if let Some(group) = self.cw_group.clone() {
-                    let sel = self.cw_stream_sel.clone();
-                    self.load_logs(group, sel);
-                }
-            }
-            Category::Kinesis => {
-                if let Some(stream) = self.kin_stream.clone() {
-                    let shard = self.kin_shard_sel.clone();
-                    self.load_search(stream, shard);
-                }
-            }
-        }
+        self.reload_output();
     }
 
     fn open_filter_input(&mut self) {
@@ -854,8 +1005,26 @@ impl App {
         self.input_prompt = "Kinesis stream name".to_string();
     }
 
+    fn open_time_input(&mut self, kind: InputKind) {
+        self.pane = Pane::Input;
+        self.input_kind = kind;
+        match kind {
+            InputKind::StartTime => {
+                self.input = self.start_expr.clone().unwrap_or_default();
+                self.input_prompt =
+                    "Start time — e.g. 5m, 2h, 1d, 2026-07-01 (empty = default)".to_string();
+            }
+            InputKind::EndTime => {
+                self.input = self.end_expr.clone().unwrap_or_default();
+                self.input_prompt = "End time — e.g. 1h, 2026-07-01 (empty = now)".to_string();
+            }
+            _ => {}
+        }
+    }
+
     fn submit_input(&mut self) {
         let value = self.input.trim().to_string();
+        let cleared = |v: String| if v.is_empty() { None } else { Some(v) };
         match self.input_kind {
             InputKind::KinesisStream => {
                 if value.is_empty() {
@@ -866,7 +1035,7 @@ impl App {
                 self.load_shards(value);
             }
             InputKind::CwFilter => {
-                self.cw_filter = if value.is_empty() { None } else { Some(value) };
+                self.cw_filter = cleared(value);
                 match self.cw_group.clone() {
                     Some(group) => {
                         let sel = self.cw_stream_sel.clone();
@@ -876,7 +1045,7 @@ impl App {
                 }
             }
             InputKind::KinFilter => {
-                self.kin_filter = if value.is_empty() { None } else { Some(value) };
+                self.kin_filter = cleared(value);
                 match self.kin_stream.clone() {
                     Some(stream) => {
                         let shard = self.kin_shard_sel.clone();
@@ -884,6 +1053,20 @@ impl App {
                     }
                     None => self.pane = Pane::Output,
                 }
+            }
+            InputKind::StartTime | InputKind::EndTime => {
+                // Validate the expression before storing so a typo surfaces
+                // immediately instead of failing the next query.
+                if !value.is_empty() && parse_datetime(Some(&value)).is_err() {
+                    self.status = format!("Error: '{value}' is not a valid time");
+                    return;
+                }
+                if self.input_kind == InputKind::StartTime {
+                    self.start_expr = cleared(value);
+                } else {
+                    self.end_expr = cleared(value);
+                }
+                self.reload_output();
             }
         }
     }
@@ -894,7 +1077,10 @@ impl App {
                 Some(stream) => self.load_shards(stream),
                 None => self.load_groups(),
             },
-            InputKind::CwFilter | InputKind::KinFilter => self.pane = Pane::Output,
+            InputKind::CwFilter
+            | InputKind::KinFilter
+            | InputKind::StartTime
+            | InputKind::EndTime => self.pane = Pane::Output,
         }
     }
 
@@ -911,20 +1097,23 @@ impl App {
     fn key_hints(&self) -> &'static str {
         match self.pane {
             Pane::Input => " Enter submit · Esc cancel ",
+            Pane::List if self.list_filtering => {
+                " Type to filter · ↑↓ select · Enter open · Esc cancel "
+            }
             Pane::List => match self.category {
                 Category::CloudWatch => {
                     if self.cw_group.is_some() {
-                        " ↑↓ move · Enter logs · Esc groups · r reload · Tab switch · q quit "
+                        " ↑↓ move · Enter logs · / find · Esc groups · r reload · Tab · q quit "
                     } else {
-                        " ↑↓ move · Enter streams · r reload · Tab switch · q quit "
+                        " ↑↓ move · Enter streams · / find · r reload · Tab · q quit "
                     }
                 }
                 Category::Kinesis => {
-                    " ↑↓ move · Enter search · Esc stream · r reload · Tab switch · q quit "
+                    " ↑↓ move · Enter search · / find · Esc stream · r reload · Tab · q quit "
                 }
             },
             Pane::Output => {
-                " ↑↓ scroll · G follow · w watch · / filter · Esc back · Tab switch · q quit "
+                " ↑↓←→ scroll · G follow · w watch · / filter · s/e time · Esc back · q quit "
             }
         }
     }
@@ -988,9 +1177,23 @@ impl App {
         f.render_widget(tabs, chunks[0]);
 
         // Main content.
+        let visible = self.visible_indices();
         let title = match self.pane {
-            Pane::List if !self.items.is_empty() => {
-                format!(" {} ({}) ", self.list_title, self.items.len())
+            Pane::List => {
+                let total = self.items.len();
+                if self.list_filtering || !self.list_filter.is_empty() {
+                    format!(
+                        " {}  /{}  ({}/{}) ",
+                        self.list_title,
+                        self.list_filter,
+                        visible.len(),
+                        total
+                    )
+                } else if total > 0 {
+                    format!(" {} ({}) ", self.list_title, total)
+                } else {
+                    format!(" {} ", self.list_title)
+                }
             }
             _ => format!(" {} ", self.main_title()),
         };
@@ -1003,19 +1206,20 @@ impl App {
         let dim = Style::default().fg(Color::DarkGray);
 
         match self.pane {
-            Pane::List if self.items.is_empty() => {
+            Pane::List if visible.is_empty() => {
                 let msg = if self.loading {
                     "  Loading…".to_string()
+                } else if !self.list_filter.is_empty() {
+                    format!("  No matches for '{}'.", self.list_filter)
                 } else {
                     self.list_empty_hint().to_string()
                 };
                 f.render_widget(Paragraph::new(msg).block(block).style(dim), area);
             }
             Pane::List => {
-                let items: Vec<ListItem> = self
-                    .items
+                let items: Vec<ListItem> = visible
                     .iter()
-                    .map(|i| ListItem::new(i.clone()))
+                    .map(|&i| ListItem::new(self.items[i].clone()))
                     .collect();
                 let list = List::new(items)
                     .block(block)
@@ -1047,9 +1251,18 @@ impl App {
                     self.scroll.min(max_start)
                 };
                 let end = (start + h).min(total);
-                let lines: Vec<Line> = self.output[start..end]
+                let window = &self.output[start..end];
+                // Track the widest visible line so horizontal scrolling can be
+                // clamped (updated here since it depends on the rendered slice).
+                self.max_line_len = window.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+                let hscroll = self.hscroll;
+                let lines: Vec<Line> = window
                     .iter()
-                    .map(|l| Line::from(l.clone()))
+                    .map(|l| {
+                        // No wrapping: skip `hscroll` columns so long lines can
+                        // be panned instead of truncated at the right edge.
+                        Line::from(l.chars().skip(hscroll).collect::<String>())
+                    })
                     .collect();
                 let para = Paragraph::new(lines).block(block);
                 f.render_widget(para, area);
@@ -1065,6 +1278,21 @@ impl App {
 
         // Status bar.
         let mut spans = vec![Span::raw(format!(" Account {} ", self.account_id))];
+        if self.pane == Pane::Output {
+            let default_start = match self.category {
+                Category::CloudWatch if self.cw_stream_sel.is_some() && !self.watching => "all",
+                _ => "30m",
+            };
+            let start = self.start_expr.as_deref().unwrap_or(default_start);
+            let end = self.end_expr.as_deref().unwrap_or("now");
+            spans.push(Span::styled(
+                format!("· window {start}→{end} "),
+                Style::default().fg(Color::Cyan),
+            ));
+            if self.hscroll > 0 {
+                spans.push(Span::raw(format!("· col {} ", self.hscroll)));
+            }
+        }
         if self.loading {
             spans.push(Span::raw("· loading "));
         }
