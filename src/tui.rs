@@ -316,11 +316,22 @@ fn build_future(
             filter,
             watch,
         } => Box::pin(async move {
+            // A specific stream is queried by exact name (no pattern/window
+            // filtering) and with no lower time bound, so its full history is
+            // shown regardless of how long it has been idle. When watching, a
+            // lookback bound keeps each poll cheap. "ALL streams" keeps the
+            // lookback window to avoid flooding the whole group.
+            let explicit_streams = stream.as_ref().map(|s| vec![s.clone()]);
+            let start = match (&stream, watch) {
+                (Some(_), false) => None,
+                _ => Some(now_minus_minutes(DEFAULT_LOOKBACK_MIN)),
+            };
             let cfg = AwsLogsConfig {
                 log_group_name: Some(group),
                 log_stream_name: Some(stream.unwrap_or_else(|| "ALL".to_string())),
+                explicit_streams,
                 filter_pattern: filter,
-                start: Some(now_minus_minutes(DEFAULT_LOOKBACK_MIN)),
+                start,
                 watch,
                 color: ColorPreference::Never,
                 output_group_enabled: false,
