@@ -136,6 +136,8 @@ awslogs tui
 awslogs tui --profile prod --aws-region eu-west-1
 ```
 
+![awslogs TUI](docs/tui.png)
+
 `awslogs tui` opens an interactive full-screen interface for navigating the same
 data the CLI exposes. It accepts the same credential/region flags as every other
 command (`--profile`, `--aws-region`, `--aws-endpoint-url`, etc.). The bottom
