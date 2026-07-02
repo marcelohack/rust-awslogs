@@ -4,6 +4,7 @@ pub mod core;
 pub mod exceptions;
 pub mod kinesis;
 pub mod time;
+pub mod tui;
 
 pub use crate::core::{AwsLogs, AwsLogsConfig, ColorPreference};
 pub use crate::exceptions::AwsLogsError;

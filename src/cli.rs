@@ -13,6 +13,7 @@ use crate::core::{AwsLogs, AwsLogsConfig, Color, ColorPreference, ansi_colored};
 use crate::exceptions::AwsLogsError;
 use crate::kinesis::{KinesisSearch, KinesisSearchConfig};
 use crate::time::parse_datetime;
+use crate::tui;
 
 /// Read AWS CloudWatch logs from the command line.
 #[derive(Debug, Parser)]
@@ -37,6 +38,8 @@ pub enum Command {
     Streams(StreamsArgs),
     /// Search Kinesis data streams
     Kinesis(KinesisArgs),
+    /// Launch the interactive terminal UI
+    Tui(TuiArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -257,6 +260,12 @@ pub struct KinesisShardsArgs {
     pub common: CommonAwsArgs,
 }
 
+#[derive(Debug, Args)]
+pub struct TuiArgs {
+    #[command(flatten)]
+    pub common: CommonAwsArgs,
+}
+
 /// Production entry point invoked from `main`.
 pub async fn run() -> i32 {
     let cli = match Cli::try_parse() {
@@ -270,6 +279,12 @@ pub async fn run() -> i32 {
         println!();
         return 1;
     };
+
+    // The TUI drives a real terminal rather than the writer-based `execute`
+    // path, so it is dispatched here before the stdout/stderr plumbing.
+    if let Command::Tui(args) = command {
+        return run_tui(args).await;
+    }
 
     // Unlocked handles: holding a StdoutLock across the `--watch` loop would
     // deadlock the Ctrl-C handler (which also writes to stdout). These lock
@@ -348,6 +363,11 @@ pub async fn execute<O: Write, E: Write>(
                 run_kinesis_shards(args, stdout, make_kinesis_client).await
             }
         },
+        // The TUI is intercepted in `run` before the writer-based path; it has
+        // no meaning against a captured writer.
+        Command::Tui(_) => Err(AwsLogsError::Aws(anyhow::anyhow!(
+            "the tui command must be launched from a real terminal"
+        ))),
     };
     handle_result(result, stderr)
 }
@@ -514,4 +534,18 @@ async fn run_kinesis_shards<O: Write>(
     KinesisSearch::new(cfg, client)?
         .list_shards_into(writer)
         .await
+}
+
+/// Launch the interactive terminal UI. The TUI owns its own AWS clients on a
+/// dedicated engine thread (see [`tui`]); here we only forward the credential
+/// options and translate the outcome into an exit code.
+async fn run_tui(args: TuiArgs) -> i32 {
+    let opts = args.common.into_credential_options();
+    match tui::run(opts).await {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("{}", ansi_colored(&format!("{}\n", err.hint()), Color::Red));
+            err.code()
+        }
+    }
 }

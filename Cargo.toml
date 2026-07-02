@@ -21,6 +21,7 @@ clap = { version = "4", features = ["derive", "env"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-cloudwatchlogs = "1"
 aws-sdk-kinesis = "1"
+aws-sdk-sts = "1"
 aws-credential-types = "1"
 aws-types = "1"
 regex = "1"
@@ -30,6 +31,7 @@ serde_json = "1"
 jmespath = "0.3"
 thiserror = "2"
 anyhow = "1"
+ratatui = "0.29"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }

@@ -37,7 +37,7 @@ cargo run --release -- get /var/log/syslog ALL --start='1h ago'
 ## Commands
 
 ```text
-awslogs [ get | groups | streams | kinesis ]
+awslogs [ get | groups | streams | kinesis | tui ]
 ```
 
 * `awslogs groups` — list existing groups
@@ -46,6 +46,7 @@ awslogs [ get | groups | streams | kinesis ]
   * Expressions are regular expressions (anchored at the start), or the literal `ALL` as a shortcut for `.*`.
 * `awslogs kinesis shards STREAM` — list the shards of a Kinesis data stream
 * `awslogs kinesis search STREAM` — read and search records across every shard of a Kinesis data stream (see [Kinesis data streams](#kinesis-data-streams))
+* `awslogs tui` — launch an interactive terminal UI for browsing the above (see [Terminal UI](#terminal-ui))
 
 You must supply a region via `--aws-region` or the `AWS_REGION` env var (or have one configured in your AWS profile).
 
@@ -125,6 +126,43 @@ awslogs get /var/log/syslog ALL --watch --watch-interval=5    # poll every 5s
 seconds (default 1). Press **Ctrl-C** at any time to stop watching — the tool
 prints `Closing...` and exits immediately with status 0, even mid-poll or while
 streaming output through a pipe.
+
+---
+
+## Terminal UI
+
+```bash
+awslogs tui
+awslogs tui --profile prod --aws-region eu-west-1
+```
+
+`awslogs tui` opens an interactive full-screen interface for navigating the same
+data the CLI exposes. It accepts the same credential/region flags as every other
+command (`--profile`, `--aws-region`, `--aws-endpoint-url`, etc.). The bottom
+status bar always shows the connected AWS **account ID** (resolved via STS
+`GetCallerIdentity`).
+
+Two categories are selectable with **Tab**:
+
+* **CloudWatch** — browse groups → streams → logs.
+* **Kinesis** — enter a stream name → shards → records.
+
+Each view drives the corresponding engine (`groups`, `streams`, `get`,
+`kinesis shards`, `kinesis search`), so behavior matches the CLI.
+
+| Key | Action |
+|---|---|
+| `Tab` | Switch category (CloudWatch ⇄ Kinesis) |
+| `↑`/`↓` (or `k`/`j`) | Move in a list / scroll output |
+| `Enter` | Drill into the selected item |
+| `Esc` | Go back up a level |
+| `r` | Reload the current list |
+| `w` | Toggle `--watch` (live tail) in a log/record view |
+| `/` | Set a filter pattern for the current view |
+| `G` / `g` | Follow tail / jump to top |
+| `q` or `Ctrl-C` | Quit |
+
+Log and record views default to the last 30 minutes.
 
 ---
 
