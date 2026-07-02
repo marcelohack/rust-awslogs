@@ -68,6 +68,13 @@ pub struct AwsLogsConfig {
     pub log_group_prefix: Option<String>,
     pub filter_pattern: Option<String>,
 
+    /// Explicit stream names to query, bypassing `log_stream_name` pattern
+    /// matching and the time-window filtering of [`streams_matching`]. Used when
+    /// the caller has already resolved exact streams (e.g. the TUI, where the
+    /// user picked a stream from a list) and must not have it dropped just
+    /// because it had no activity inside the events window.
+    pub explicit_streams: Option<Vec<String>>,
+
     // Window (epoch ms)
     pub start: Option<i64>,
     pub end: Option<i64>,
@@ -94,6 +101,7 @@ impl Default for AwsLogsConfig {
             log_stream_name: None,
             log_group_prefix: None,
             filter_pattern: None,
+            explicit_streams: None,
             start: None,
             end: None,
             watch: false,
@@ -231,7 +239,19 @@ impl AwsLogs {
             .clone()
             .unwrap_or_else(|| ALL_WILDCARD.to_string());
 
-        let streams: Vec<String> = if stream_pattern != ALL_WILDCARD {
+        let streams: Vec<String> = if let Some(explicit) = self.cfg.explicit_streams.clone() {
+            // Caller already resolved exact streams: use them verbatim, skipping
+            // pattern matching and window filtering (which could otherwise drop a
+            // deliberately-selected stream that has been idle).
+            if explicit.len() > FILTER_LOG_EVENTS_STREAMS_LIMIT {
+                return Err(AwsLogsError::TooManyStreamsFiltered {
+                    pattern: explicit.join(","),
+                    count: explicit.len(),
+                    limit: FILTER_LOG_EVENTS_STREAMS_LIMIT,
+                });
+            }
+            explicit
+        } else if stream_pattern != ALL_WILDCARD {
             let matched = self.streams_matching(&group, &stream_pattern).await?;
             if matched.len() > FILTER_LOG_EVENTS_STREAMS_LIMIT {
                 return Err(AwsLogsError::TooManyStreamsFiltered {

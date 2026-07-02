@@ -155,16 +155,27 @@ Each view drives the corresponding engine (`groups`, `streams`, `get`,
 | Key | Action |
 |---|---|
 | `Tab` | Switch category (CloudWatch ⇄ Kinesis) |
-| `↑`/`↓` (or `k`/`j`) | Move in a list / scroll output |
+| `↑`/`↓` (or `k`/`j`) | Move in a list / scroll output vertically |
+| `←`/`→` (or `h`/`l`) | Scroll a log/record view horizontally (long lines) |
 | `Enter` | Drill into the selected item |
 | `Esc` | Go back up a level |
 | `r` | Reload the current list |
+| `/` | Fast-find within a list; set a filter pattern in a log/record view |
 | `w` | Toggle `--watch` (live tail) in a log/record view |
-| `/` | Set a filter pattern for the current view |
+| `s` / `e` | Set the start / end time of a log/record view |
 | `G` / `g` | Follow tail / jump to top |
+| `0` | Reset horizontal scroll |
 | `q` or `Ctrl-C` | Quit |
 
-Log and record views default to the last 30 minutes.
+**Fast-find:** press `/` in any list and type to narrow it (case-insensitive
+substring); `↑`/`↓` move through matches, `Enter` opens the highlighted one,
+`Esc` clears.
+
+**Time window:** log/record views default to the last 30 minutes (an explicitly
+selected single stream shows its full history). Press `s`/`e` to set a start/end
+using the same expressions as the CLI `--start`/`--end` (`5m`, `2h`, `1d`,
+absolute dates); leave the field empty to reset to the default. The active
+window is shown in the status bar.
 
 ---
 
